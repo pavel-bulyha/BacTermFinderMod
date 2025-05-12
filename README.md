@@ -1,6 +1,6 @@
-# Modification for the BacTermFinder program.
+# Modification for the BacTermFinder program.<br>
 **Link to the original:** https://github.com/BioinformaticsLabAtMUN/BacTermFinder<br>
-**The command to start the program is replaced by is replaced by:** python genome_scan.py [genome fasta file] [sliding window step] [output file prefix] [feature generation batch size] [threshold] > log.out
+**The command to start the program is replaced by is replaced by:** python genome_scan.py [genome fasta file] [sliding window step] [output file prefix] [feature generation batch size] [threshold] > log.out<br>
 ---
 List of main modifications:
 1. The program is configured to work with files of the .gb format;
