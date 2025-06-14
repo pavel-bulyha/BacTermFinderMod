@@ -1,9 +1,3 @@
-# this files reads a genome fasta file
-# then create sequences of 100 bb based on sliding window of that got from the sys.argv
-# then it generates features for the sequences with FileProcessing module in iLearnPlus
-# then loads the trained model and predicts the sequences
-# then it writes the results in a file, results have the position of the sequence and the probability and the sequence itself
-
 import os
 import pickle
 import re
@@ -34,11 +28,16 @@ def terminator_filter_decorator(func):
       1. If an annotated terminator interval is completely contained within any original annotation interval.
       2. If an annotated terminator interval overlaps any original annotation interval by more than 25% of its length.
       3. If the annotated terminator interval overlaps any original annotation interval by more than 50 nucleotides.
+      4. If there are annotations present, the distance from the end of the nearest original feature
+         on the same strand to the start of the terminator must be ≤ 200 nucleotides; otherwise it is filtered out.
+         If no annotations are found in the GenBank file, this distance filter is skipped and a warning
+         is printed: "Attention: No annotation found in file, filtering by genes, ORFs and operons is not possible".
 
     After filtering, all intervals that are at most 75 nucleotides apart are merged together.
     The overall probability is calculated using the median, resulting in new start and end coordinates.
-    Finally, if any interval exceeds 150 nucleotides in length, it is trimmed from both ends (by 5 nucleotides
-    per iteration) until its length is less than or equal to 150 (if already shorter, the trimming stops).
+    Finally, if any interval exceeds 150 nucleotides in length, it is trimmed from both ends
+    (by 5 nucleotides per iteration) until its length is less than or equal to 150
+    (if already shorter, the trimming stops).
 
     The function extracts `genome_file` from **kwargs automatically. If `genome_file` is missing,
     an exception is raised. This allows post-processing to be optional and easily disabled.
@@ -53,7 +52,6 @@ def terminator_filter_decorator(func):
     This decorator uses the 'strand' column of the input and compares it with the
     'strand' extracted from the GenBank file (converted to '+' or '-' accordingly).
     """
-
     def wrapper(*args, **kwargs):
         # Extract genome_file from kwargs
         genome_file = kwargs.get('genome_file')
@@ -99,7 +97,10 @@ def terminator_filter_decorator(func):
                     'strand': o_strand
                 })
 
-#       pd.DataFrame(original_intervals).to_csv("original_intervals.csv", index=False, header=False)
+        # Check if annotation exists
+        has_annotation = len(original_intervals) > 0
+        if not has_annotation:
+            print("Attention: No annotation found in file, filtering by genes, ORFs and operons is not possible")
 
         # Helper function to calculate overlap length between two intervals
         def get_overlap(a_start, a_end, b_start, b_end):
@@ -124,6 +125,34 @@ def terminator_filter_decorator(func):
                 # Condition 3: or overlap is more than 50 nucleotides
                 if overlap > 0.25 * orig_length or overlap > 50:
                     return True
+
+            # Condition 4: if annotations exist, distance to nearest feature must be ≤ 200 nt
+            if has_annotation:
+                if row['strand'] == '+':
+                    # upstream for +: features whose END ≤ start of terminator
+                    dists = [
+                        row['start'] - orig['end']
+                        for orig in original_intervals
+                        if row['chrom'] == orig['chrom']
+                        and orig['strand'] in ('.', '+')
+                        and orig['end'] <= row['start']
+                    ]
+                elif row['strand'] == '-':
+                    # upstream for –: features whose START ≥ end terminator
+                    dists = [
+                        orig['start'] - row['end']
+                        for orig in original_intervals
+                        if row['chrom'] == orig['chrom']
+                        and orig['strand'] in ('.', '-')
+                        and orig['start'] >= row['end']
+                    ]
+                else:
+                    dists = []
+
+                # if there is no upstream feature or the closest one is further than 200 nt - discard
+                if not dists or min(dists) > 250:
+                    return True
+
             return False
 
         # Remove intervals that must be filtered out
@@ -233,7 +262,6 @@ def extract_sliding_windows(ref_genome_file: str, window_size: int,
         windows, columns=['u_id', 'seq_id', 'start', 'end', 'seq', 'strand'])
 
     return df
-
 
 def df_to_fasta(df: pd.DataFrame, filename: str, train_stat="testing") -> None: #TODO: This could be written to work faster
     """This function writes a Pandas DataFrame to a FASTA file.
@@ -354,8 +382,6 @@ def read_csv_low(file, data_path, input_dim):
 def process_and_merge_dataframe(genome_file: str,
                                 df: pd.DataFrame,
                                 filter_threshold: float,
-                                gap: int = 3,
-                                agg_func: str = 'median',
                                 file_format: str = file_format) -> pd.DataFrame:
     """
     Processes a DataFrame with BacTermFinder data.
@@ -369,132 +395,61 @@ def process_and_merge_dataframe(genome_file: str,
     Steps of the function:
       1. Extracts the chromosome, start and end coordinates, and strand from SampleName.
       2. Filters the dataset by 'probability_mean' (keeps rows where the value is > filter_threshold).
-      3. Sorts the data by 'chrom', 'strand', and 'start'.
-      4. Groups the data by 'chrom' and 'strand', merging intervals if the gap between them does not exceed `gap`.
-      5. Aggregates probability values (using median or mean).
 
     Arguments:
-      genome_file      : Used in decorator
+      genome_file      : Used in decorator for GenBank-based filtering.
       df               : The input DataFrame containing the 'SampleName' column and prediction columns.
       filter_threshold : Threshold for filtering by 'probability_mean'.
-      gap              : Maximum distance between regions to be merged.
-      agg_func         : Aggregation method ('median' or 'mean').
       file_format      : The format of SampleName ('fasta' or 'genbank').
 
     Returns:
-      A DataFrame with merged intervals.
+      A DataFrame of **raw** terminator candidates with columns:
+      ['chrom','strand','start','end','probability_binary',
+       'probability_ENAC','probability_PS2','probability_NCP','probability_mean']
+      — ready for post-processing by the decorator.
     """
-    # Create a copy of the original DataFrame
     df = df.copy()
 
-    # Extract information from SampleName
+    # Parsing SampleName
     if file_format.lower() == 'fasta':
         splits = df['SampleName'].str.split('_')
-        df['chrom'] = splits.str[1]
-        try:
-            df['start'] = splits.str[2].astype(int)
-            df['end'] = splits.str[3].astype(int)
-        except ValueError as e:
-            raise ValueError(f"Error converting coordinates to int. The string format may be different: {e}")
+        df['chrom']  = splits.str[1]
+        df['start']  = splits.str[2].astype(int)
+        df['end']    = splits.str[3].astype(int)
         df['strand'] = splits.str[4]
-    elif file_format.lower() == 'genbank':
-        def parse_gb(sample_name: str):
-            parts = sample_name.split('_')
-            # If we get 6 tokens, we assume the format "1_NZ_CP017481.1_0_101_+"
-            if len(parts) == 6:
-                try:
-                    # Combine the second and third tokens into accession (chromosome)
-                    chrom = parts[1] + "_" + parts[2]
-                    start = int(parts[3])
-                    end = int(parts[4])
-                    strand = parts[5]
-                    return chrom, start, end, strand
-                except Exception as e:
-                    raise ValueError(f"Error parsing SampleName '{sample_name}' with 6 tokens: {e}")
-            # If we get 5 tokens, we use standard logic
-            elif len(parts) == 5:
-                try:
-                    chrom = parts[1]
-                    start = int(parts[2])
-                    end = int(parts[3])
-                    strand = parts[4]
-                    return chrom, start, end, strand
-                except Exception as e:
-                    raise ValueError(f"Error parsing SampleName '{sample_name}' with 5 tokens: {e}")
-            else:
-                # Alternative: try a regular expression in case of a different format,
-                # for example: "CP017481.1:150-300(+)"
-                pattern = re.compile(r'^(?P<chrom>[\w\.]+):(?P<start>\d+)[\-:](?P<end>\d+)\((?P<strand>[\+\-])\)')
-                match = pattern.search(sample_name)
-                if not match:
-                    raise ValueError(f"Unable to recognize SampleName in genbank format: {sample_name}")
-                return (match.group('chrom'),
-                        int(match.group('start')),
-                        int(match.group('end')),
-                        match.group('strand'))
 
+    elif file_format.lower() == 'genbank':
+        import re
+        def parse_gb(name: str):
+            parts = name.split('_')
+            if len(parts) == 6:
+                chrom = parts[1] + "_" + parts[2]
+                return chrom, int(parts[3]), int(parts[4]), parts[5]
+            if len(parts) == 5:
+                return parts[1], int(parts[2]), int(parts[3]), parts[4]
+            pat = re.compile(r'^(?P<chrom>[\w\.]+):(?P<start>\d+)[\-:](?P<end>\d+)\((?P<strand>[\+\-])\)')
+            m = pat.search(name)
+            if not m:
+                raise ValueError(f"Can't parse GenBank SampleName: {name}")
+            return (m.group('chrom'),
+                    int(m.group('start')),
+                    int(m.group('end')),
+                    m.group('strand'))
         parsed = df['SampleName'].apply(parse_gb)
-        df[['chrom', 'start', 'end', 'strand']] = pd.DataFrame(parsed.tolist(), index=df.index)
+        df[['chrom','start','end','strand']] = pd.DataFrame(parsed.tolist(), index=df.index)
+
     else:
         raise ValueError(f"Unknown format: {file_format}")
 
-    # Filter by 'probability_mean'
+    # We leave only the threshold for average probability
     df = df[df['probability_mean'] > filter_threshold].reset_index(drop=True)
 
-    # Sort by chromosome, strand and initial coordinate
-    df = df.sort_values(by=['chrom', 'strand', 'start']).reset_index(drop=True)
+    # sorting for stability
+    df = df.sort_values(['chrom','strand','start']).reset_index(drop=True)
 
-    # Columns with probabilities
-    prob_cols = ['probability_binary', 'probability_ENAC', 'probability_PS2',
-                 'probability_NCP', 'probability_mean']
+    # IMPORTANT: There is NO merging or aggregation here - the decorator will handle that.
+    return df
 
-    def merge_intervals(group: pd.DataFrame, gap: int, agg_func: str) -> pd.DataFrame:
-        merged = []
-        current = {'start': group.iloc[0]['start'], 'end': group.iloc[0]['end']}
-        current_probs = {col: [group.iloc[0][col]] for col in prob_cols}
-
-        for i in range(1, len(group)):
-            row = group.iloc[i]
-            if row['start'] <= current['end'] + gap:
-                current['end'] = max(current['end'], row['end'])
-                for col in prob_cols:
-                    current_probs[col].append(row[col])
-            else:
-                aggregated = {}
-                for col in prob_cols:
-                    s = pd.Series(current_probs[col])
-                    aggregated[col] = s.median() if agg_func == 'median' else s.mean()
-                merged.append({
-                    'chrom': group.iloc[0]['chrom'],
-                    'strand': group.iloc[0]['strand'],
-                    'start': current['start'],
-                    'end': current['end'],
-                    **aggregated
-                })
-                current = {'start': row['start'], 'end': row['end']}
-                current_probs = {col: [row[col]] for col in prob_cols}
-
-        aggregated = {}
-        for col in prob_cols:
-            s = pd.Series(current_probs[col])
-            aggregated[col] = s.median() if agg_func == 'median' else s.mean()
-        merged.append({
-            'chrom': group.iloc[0]['chrom'],
-            'strand': group.iloc[0]['strand'],
-            'start': current['start'],
-            'end': current['end'],
-            **aggregated
-        })
-        return pd.DataFrame(merged)
-
-    merged_list = []
-    for (ch, strand), group in df.groupby(['chrom', 'strand']):
-        group = group.sort_values(by='start').reset_index(drop=True)
-        merged_group = merge_intervals(group, gap, agg_func)
-        merged_list.append(merged_group)
-
-    merged_df = pd.concat(merged_list, ignore_index=True)
-    return merged_df
 
 def annotate_rho_dependent_terminator(df: pd.DataFrame, genome_file: str) -> None:
     """

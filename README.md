@@ -5,6 +5,10 @@
 ```bash
 python genome_scan.py [genome fasta file] [sliding window step] [output file prefix] [feature generation batch size] [threshold] > log.out<br>
 ```
+**recommended command**
+```bash
+python genome_scan.py annotatedHI.gb 3 out 10000 0.95 > log.out
+```
 ---
 List of main modifications:
 1. The program is configured to work with files of the .gb format;
